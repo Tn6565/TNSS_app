@@ -1,101 +1,109 @@
 import os
 import streamlit as st
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
 import tweepy
-from filelock import FileLock  # ファイルロック追加
 from openai import OpenAI
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+load_dotenv()
 
-# ====== 初期設定 ======
+# --- APIキー読み込み ---
+OPENAI_API_KEY = os.environ.get("TN_system")
+X_BEARER_TOKEN = os.environ.get("TNSS_BEARER_TOKEN")
+X_API_KEY = os.environ.get("TNSS_API_KEY_for_X")
+X_API_SECRET = os.environ.get("TNSS_API_SECRET_KEY_for_X")
+X_ACCESS_TOKEN = os.environ.get("TNSS_ACCESS_TOKEN")
+X_ACCESS_SECRET = os.environ.get("TNSS_ACCSES_TOKEN_SECRET")
 
-load_dotenv()  # .envからAPIキーを環境変数に読み込み
+# --- OpenAIクライアント ---
+client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# 各種APIキーをos.environから取得
-openai_api_key = os.environ.get("TN_SYSTEM")
-consumer_key = os.environ.get("TNSS_API_KEY_for_X")
-consumer_secret = os.environ.get("TNSS_API_SECRET_KEY_for_X")
-access_token = os.environ.get("TNSS_ACCESS_TOKEN")
-access_token_secret = os.environ.get("TNSS_API_SECRET_KEY_for_X")
+# --- Tweepyクライアント ---
+client = tweepy.Client(
+    bearer_token=X_BEARER_TOKEN,
+    consumer_key=X_API_KEY,
+    consumer_secret=X_API_SECRET,
+    access_token=X_ACCESS_TOKEN,
+    access_token_secret=X_ACCESS_SECRET
+)
 
-# APIキー未設定時のエラー
-if not all([openai_api_key, consumer_key, consumer_secret, access_token, access_token_secret]):
-    st.error("APIキーが設定されていません。環境変数または.envファイルを確認してください。")
-    st.stop()
+st.title("TN SERCH POST FOR X")
 
-# LangChain(OpenAI) 初期化
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.9, openai_api_key=openai_api_key)
+# --- お気に入り管理 ---
+if "favorites" not in st.session_state:
+    st.session_state.favorites = []
 
-# Tweepy(X) 初期化
-auth = tweepy.OAuthHandler(consumer_key, consumer_secret)
-auth.set_access_token(access_token, access_token_secret)
-api = tweepy.API(auth)
+username = st.text_input("ユーザー名（@以降）を入力してお気に入りに追加")
 
-# 利用制限
-MAX_REQUESTS_PER_DAY = 15
-counter_file = "request_counter.txt"
-lock_file = counter_file + ".lock"  # ファイルロック用
+if st.button("お気に入りに追加"):
+    if username and username not in st.session_state.favorites:
+        st.session_state.favorites.append(username)
+        st.success(f"{username} をお気に入りに追加しました")
 
-def read_count():
-    with FileLock(lock_file):
-        if not os.path.exists(counter_file):
-            return 0
-        with open(counter_file, "r") as f:
-            return int(f.read().strip() or 0)
-
-def write_count(count):
-    with FileLock(lock_file):
-        with open(counter_file, "w") as f:
-            f.write(str(count))
-
-today_count = read_count()
-
-# ====== Streamlit UI ======
-st.title("📝 X 投稿支援アプリ")
-topic = st.text_input("投稿のトピックを入力してください:")
-
-if "candidates" not in st.session_state:
-    st.session_state.candidates = []
-
-# ====== 投稿文生成 ======
-if st.button("候補を生成する", disabled=(today_count >= MAX_REQUESTS_PER_DAY)):
-    if today_count >= MAX_REQUESTS_PER_DAY:
-        st.error("⚠️ 本日の投稿上限（15件）に達しました。")
-    else:
-        prompt = PromptTemplate(
-            input_variables=["topic"],
-            template="以下のトピックについて、ラフでカジュアルな口調で、140文字以内の投稿文を3つ作成してください。\n\nトピック: {topic}",
-        )
-        chain = LLMChain(llm=llm, prompt=prompt)
+# --- 指定日付の投稿参照 ---
+st.header("指定日付の投稿を参照してリライト")
+if st.session_state.favorites:
+    selected_user = st.selectbox("お気に入りから選択", st.session_state.favorites)
+    target_date = st.date_input("参照したい日付を選択", value=date.today() - timedelta(days=1))
+    if st.button("指定日付の投稿を取得"):
         try:
-            result = chain.run(topic=topic)
-            # 箇条書きや番号付きにも対応
-            candidates = [c.lstrip("0123456789.・- ").strip() for c in result.split("\n") if c.strip()]
-            st.session_state.candidates = [c[:140] for c in candidates if c]
-            st.success("✅ 投稿候補を生成しました。")
-        except Exception as e:
-            st.error(f"生成に失敗しました: {e}")
+            user_info = client.get_user(username=selected_user)
+            user_id = user_info.data.id
 
-# ====== 候補表示と投稿 ======
-if st.session_state.candidates:
-    st.subheader("生成された候補")
-    for i, c in enumerate(st.session_state.candidates, 1):
-        st.write(f"{i}. {c}")
-        post_btn = st.button(
-            f"この投稿を送信する → 候補 {i}",
-            key=f"post_{i}",
-            disabled=(today_count >= MAX_REQUESTS_PER_DAY)
-        )
-        if post_btn:
-            if today_count >= MAX_REQUESTS_PER_DAY:
-                st.error("⚠️ 本日の投稿上限（15件）に達しました。")
+            # 指定日の0:00:00～23:59:59で範囲指定
+            start_time = datetime.combine(target_date, datetime.min.time()).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_time = (datetime.combine(target_date, datetime.max.time()) - timedelta(microseconds=999999)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            tweets = client.get_users_tweets(
+                id=user_id,
+                start_time=start_time,
+                end_time=end_time,
+                max_results=10,
+                tweet_fields=["created_at"]
+            )
+
+            if tweets.data:
+                for i, tweet in enumerate(tweets.data, 1):
+                    st.write(f"【{i}件目】{tweet.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                    st.write(tweet.text)
+                    if st.button(f"このツイートをリライト {i}"):
+                        response = client_ai.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "system", "content": "与えられた文章を自然にリライトしてください"},
+                                {"role": "user", "content": tweet.text}
+                            ]
+                        )
+                        rewritten = response.choices[0].message.content
+                        st.subheader("リライト結果（プレビュー）")
+                        st.write(rewritten)
+                        if st.button(f"この内容で投稿 {i}"):
+                            client.create_tweet(text=rewritten)
+                            st.success("投稿しました！")
             else:
-                try:
-                    api.update_status(c)
-                    st.success(f"✅ 投稿しました: {c}")
-                    today_count += 1
-                    write_count(today_count)
-                    st.info(f"本日の利用回数: {today_count}/{MAX_REQUESTS_PER_DAY}")
-                except Exception as e:
-                    st.error(f"投稿に失敗しました: {e}")
+                st.warning("指定日付の投稿が見つかりませんでした。")
+        except Exception as e:
+            st.error(f"エラーが発生しました: {str(e)}")
+
+# --- 手動コピペリライト ---
+st.header("手動でコピペしたテキストをリライト")
+manual_text = st.text_area("リライトしたい文章をここに貼り付けてください")
+if st.button("コピペ文をリライト"):
+    if manual_text.strip():
+        try:
+            response = client_ai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "与えられた文章を自然にリライトしてください"},
+                    {"role": "user", "content": manual_text}
+                ]
+            )
+            rewritten = response.choices[0].message.content
+            st.subheader("リライト結果（プレビュー）")
+            st.write(rewritten)
+            if st.button("この内容で投稿（コピペ文）"):
+                client.create_tweet(text=rewritten)
+                st.success("投稿しました！")
+        except Exception as e:
+            st.error(f"エラーが発生しました: {str(e)}")
+    else:
+        st.warning("文章を入力してください。")
